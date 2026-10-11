@@ -23,7 +23,7 @@
 ## 🚀 快速开始
 
 ```bash
-bash <(curl -Ls https://realm.shuijiao.de)
+bash <(curl -Ls https://realm.siaoz.si)
 ```
 
 ---
