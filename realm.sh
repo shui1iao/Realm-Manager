@@ -4,7 +4,7 @@
 
 set -Eeuo pipefail
 
-VERSION="0.1.5"
+VERSION="0.1.6"
 REPO_RAW="https://raw.githubusercontent.com/shui1iao/Realm-Manager/main"
 UPDATE_URL="$REPO_RAW/realm.sh"
 VERSION_URL="$REPO_RAW/version.txt"
@@ -71,8 +71,9 @@ arch_asset() {
 	arch="$(uname -m)"
 	case "$arch" in
 	x86_64 | amd64) echo "realm-x86_64-unknown-linux-gnu.tar.gz" ;;
+	aarch64 | arm64) echo "realm-aarch64-unknown-linux-gnu.tar.gz" ;;
 	*)
-		err "暂只支持 amd64/x86_64，当前架构：$arch"
+		err "暂只支持 amd64/arm64，当前架构：$arch"
 		exit 1
 		;;
 	esac
@@ -82,7 +83,7 @@ latest_realm_version() {
 	local tag
 	tag="$(curl -fsSL https://api.github.com/repos/zhboner/realm/releases/latest | grep -m1 '"tag_name"' | sed -E 's/.*"v?([0-9.]+)".*/\1/' || true)"
 	if [[ ! "$tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-		tag="2.7.0"
+		tag="2.9.6"
 		warn "获取最新版失败，使用备用版本 v$tag"
 	fi
 	echo "$tag"
@@ -129,14 +130,17 @@ install_realm() {
 	tmp="$(mktemp -d)"
 
 	info "下载 Realm v$ver ($asset)"
-	curl -fL --retry 3 -o "$tmp/realm.tar.gz" "$url"
+	trap 'rm -rf -- "$tmp"' RETURN
+	curl -fsSL --retry 3 -o "$tmp/realm.tar.gz" "$url"
+	tar -tzf "$tmp/realm.tar.gz" >/dev/null
 	tar -xzf "$tmp/realm.tar.gz" -C "$tmp"
 	install -m 0755 "$tmp/realm" "$REALM_BIN"
 	rm -rf "$tmp"
 
 	write_default_config
 	write_service
-	systemctl enable --now realm.service
+	systemctl enable realm.service
+	systemctl restart realm.service
 	log "installed realm v$ver"
 	ok "Realm 核心已安装/更新并启动"
 }
@@ -145,9 +149,33 @@ validate_port() {
 	[[ "$1" =~ ^[0-9]+$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535))
 }
 
+validate_host() {
+	local h="$1"
+	[[ -n "$h" && ${#h} -le 253 ]] || return 1
+	[[ "$h" != *[[:space:]]* && "$h" != *'"'* && "$h" != *"'"* && "$h" != *'\'* ]] || return 1
+	if [[ "$h" == \[*\] ]]; then
+		local inner="${h#\[}"
+		inner="${inner%\]}"
+		[[ "$inner" =~ ^[0-9A-Fa-f:]+$ && "$inner" == *:* ]]
+	elif [[ "$h" == *:* ]]; then
+		[[ "$h" =~ ^[0-9A-Fa-f:]+$ ]]
+	else
+		[[ "$h" =~ ^[A-Za-z0-9._-]+$ ]]
+	fi
+}
+
+format_host_port() {
+	local h="$1" p="$((10#$2))"
+	if [[ "$h" == *:* && "$h" != \[*\] ]]; then
+		printf '[%s]:%s' "$h" "$p"
+	else
+		printf '%s:%s' "$h" "$p"
+	fi
+}
+
 valid_addr_port() {
 	[[ "$1" =~ ^(.+):([0-9]+)$ ]] || return 1
-	validate_port "${BASH_REMATCH[2]}"
+	validate_host "${BASH_REMATCH[1]}" && validate_port "${BASH_REMATCH[2]}"
 }
 
 escape_comment() {
@@ -175,8 +203,8 @@ add_rule() {
 		return 1
 	}
 	read -rp "目标地址/IP: " remote_host
-	[[ -n "$remote_host" ]] || {
-		err "目标地址不能为空"
+	validate_host "$remote_host" || {
+		err "目标地址格式无效（禁止空白/引号/非法字符）"
 		return 1
 	}
 	read -rp "目标端口: " remote_port
@@ -217,7 +245,7 @@ add_rule() {
 # id: $id
 # 备注: $remark
 listen = "$listen_addr"
-remote = "$remote_host:$remote_port"
+remote = "$(format_host_port "$remote_host" "$remote_port")"
 EOF_RULE
 	restart_if_installed
 	log "add rule id=$id $listen_addr -> $remote_host:$remote_port"
@@ -257,15 +285,20 @@ delete_rule() {
 
 	tmp="$(mktemp)"
 	awk -v target="$id" '
-    BEGIN { inblk=0; drop=0; buf=""; matched=0 }
-    /^\[\[endpoints\]\]/ { flush(); inblk=1; drop=0; buf=$0 ORS; next }
+    BEGIN { inblk=0; drop=0; has_id=0; auto_id=0; buf=""; matched=0 }
+    /^\[\[endpoints\]\]/ { flush(); inblk=1; drop=0; has_id=0; auto_id++; buf=$0 ORS; next }
     inblk && /^# id:/ {
+      has_id=1
       split($0, a, " "); if (a[3] == target) { drop=1; matched=1 }
       buf = buf $0 ORS; next
     }
     inblk { buf = buf $0 ORS; next }
     { print }
-    function flush() { if (inblk && !drop) printf "%s", buf; inblk=0; drop=0; buf="" }
+    function flush() {
+      if (inblk && !has_id && (auto_id == target)) { drop=1; matched=1 }
+      if (inblk && !drop) printf "%s", buf
+      inblk=0; drop=0; has_id=0; buf=""
+    }
     END { flush(); if (!matched) exit 42 }
   ' "$CONFIG_FILE" >"$tmp" || {
 		local code=$?
@@ -306,7 +339,7 @@ manage_cron() {
 	case "$c" in
 	1)
 		read -rp "每天几点重启（0-23）: " h
-		[[ "$h" =~ ^[0-9]+$ ]] && ((h >= 0 && h <= 23)) || {
+		[[ "$h" =~ ^[0-9]+$ ]] && ((10#$h >= 0 && 10#$h <= 23)) && h=$((10#$h)) || {
 			err "小时无效"
 			return 1
 		}
@@ -349,9 +382,11 @@ check_update() {
 	tmp="$(mktemp)"
 	curl -fsSL "$UPDATE_URL" -o "$tmp"
 	bash -n "$tmp"
-	install -m 0755 "$tmp" "$0"
+	local target="$0"
+	[[ -f "$target" && -w "$target" ]] || target="/usr/local/bin/realm-manager"
+	install -m 0755 "$tmp" "$target"
 	rm -f "$tmp"
-	ok "脚本已更新，请重新运行"
+	ok "脚本已更新至 $target，请重新运行"
 	exit 0
 }
 
